@@ -10,350 +10,599 @@ import csv
 import matplotlib.pyplot as plt
 import pygame
 import plotly.graph_objects as go
+from datetime import datetime
+
 
 # --- IMPORT SEUS MODULOS EXISTENTES ---
-# Certifique-se que esses arquivos estao na mesma pasta
 import encoder
 import odometry
 import serialCom
 import goToGoal
 
 # ==========================================
-# VARIÁVEIS GLOBAIS DE CONTROLE E SINCRONIA
+# VARIÁVEIS GLOBAIS COMPARTILHADAS
 # ==========================================
-program_running = True  # Flag mestre para parar todas as threads
-global_start_time = time.time()  # Tempo zero compartilhado
-data_lock = threading.Lock()  # Para evitar conflito de escrita se necessário
+program_running = True
+global_start_time = time.time()
+
+# Locks para segurança entre threads
+data_lock = threading.Lock()  # Para imagens e flags
+pose_lock = threading.Lock()  # Para odometria e trajetória
+
+# Estado do Sistema
+VISUAL_READY = False  # Só inicia o robô quando a câmera pegar o ArUco
+ROBOT_FINISHED = False
+
+# Dados Compartilhados (Imagens)
+shared_frame_rtsp = None
+shared_frame_webcam = None
+
+# Dados Compartilhados (Pose e Trajetória para visualização)
+shared_robot_pose = {"x": 0, "y": 0, "theta": 0}
+shared_trajectory_points = []  # Lista de tuplas (x, y)
+shared_current_goal = (0, 0)
 
 
-# ==========================================
-# THREAD 1: VISUAL ODOMETRY (RTSP + ARUCO)
-# ==========================================
 def run_visual_odometry():
-    global program_running, global_start_time
+    global \
+        program_running, \
+        global_start_time, \
+        shared_frame_rtsp, \
+        VISUAL_READY, \
+        data_lock
 
-    # CONFIGURAÇÃO
-    TAMANHO_REAL_MARKER = 0.15  # 15 cm
+    # --- CONFIG ---
+    TAMANHO_REAL_MARKER = 0.15  # Metros
     ARUCO_ID = 42
     RTSP_URL = "rtsp://admin:nupedee7@192.168.0.108:554/cam/realmonitor?channel=1&subtype=0&proto=Onvif"
 
+    # Nome do arquivo de saída (padrão KAIST)
+    CSV_FILENAME = "global_pose.csv"
+
+    # --- CALIBRAÇÃO--- Implementar
+    c_w, c_h = 1280, 720
+    focal_length = c_w
+    center = (c_w / 2, c_h / 2)
+    camera_matrix = np.array(
+        [[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]],
+        dtype="double",
+    )
+    dist_coeffs = np.zeros((4, 1))
+
+    # Pontos 3D do Marker
+    half_size = TAMANHO_REAL_MARKER / 2
+    obj_points = np.array(
+        [
+            [-half_size, half_size, 0],
+            [half_size, half_size, 0],
+            [half_size, -half_size, 0],
+            [-half_size, -half_size, 0],
+        ],
+        dtype=np.float32,
+    )
+
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
+    print("[THREAD VISUAL] Conectando ao RTSP...")
     cap = cv2.VideoCapture(RTSP_URL)
+
+    # Cria/Limpa o arquivo CSV e prepara o writer
+    csv_file = open(CSV_FILENAME, mode="w", newline="")
+    csv_writer = csv.writer(csv_file)
 
     aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
     parameters = aruco.DetectorParameters()
     detector = aruco.ArucoDetector(aruco_dict, parameters)
 
-    ground_truth_data = []
-
-    # Variáveis para armazenar a pose inicial (First Frame)
-    initial_pose = None  # Vai guardar {'x': val, 'y': val, 'theta': val}
-
-    print("[THREAD 1] Visual Odometry Iniciada...")
+    print(f"[THREAD VISUAL] Salvando Ground Truth em: {CSV_FILENAME}")
 
     while program_running:
         ret, frame = cap.read()
         if not ret:
-            print("[THREAD 1] Erro ao ler frame RTSP.")
             time.sleep(0.1)
             continue
+
+        # Timestamp KAIST: Nanosegundos do sistema
+        timestamp_ns = time.time_ns()
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, rejected = detector.detectMarkers(gray)
 
-        current_time = time.time() - global_start_time
+        # Variáveis para display
+        display_x, display_y = 0.0, 0.0
 
-        if ids is not None and ARUCO_ID in ids:
-            idx = np.where(ids == ARUCO_ID)[0][0]
-            c = corners[idx][0]
+        if ids is not None:
+            aruco.drawDetectedMarkers(frame, corners, ids)
 
-            # --- 1. CÁLCULO GEOMÉTRICO (Sem matriz de calibração) ---
+            if ARUCO_ID in ids:
+                idx = np.where(ids == ARUCO_ID)[0][0]
+                marker_corners = corners[idx][0]
 
-            # Cantos: 0=TopLeft, 1=TopRight, 2=BottomRight, 3=BottomLeft
-            p0, p1 = c[0], c[1]
+                # 1. SolvePnP (Marker no referencial da Câmera)
+                success, rvec, tvec = cv2.solvePnP(
+                    obj_points,
+                    marker_corners,
+                    camera_matrix,
+                    dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                )
 
-            # Distância em pixels (largura)
-            largura_px = math.sqrt((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2)
+                if success:
+                    cv2.drawFrameAxes(
+                        frame, camera_matrix, dist_coeffs, rvec, tvec, 0.1
+                    )
 
-            if largura_px > 0:
-                scale = TAMANHO_REAL_MARKER / largura_px
+                    # --- MATEMÁTICA DA ODOMETRIA (Inversão) ---
+                    # Queremos a Pose da Câmera no Mundo (Referencial do Marker)
 
-                # Centro em Pixels
-                cx_px = (c[0][0] + c[2][0]) / 2
-                cy_px = (c[0][1] + c[2][1]) / 2
+                    # 1. Rotação (Marker -> Câmera)
+                    R_mk_cam, _ = cv2.Rodrigues(rvec)
 
-                # Posição Absoluta no Mundo (Baseada no canto 0,0 da imagem)
-                abs_x = cx_px * scale
-                # Invertendo Y para corresponder ao plano cartesiano padrão (fundo pra cima)
-                height_img, _, _ = frame.shape
-                abs_y = (height_img - cy_px) * scale
+                    # 2. Rotação (Câmera -> Mundo) = Transposta
+                    R_cam_world = R_mk_cam.T
 
-                # --- CÁLCULO DO THETA (Ângulo) ---
-                # Calculamos o arco tangente da linha superior do marcador
-                # Delta Y e Delta X entre TopRight e TopLeft
-                delta_y = p1[1] - p0[1]
-                delta_x = p1[0] - p0[0]
+                    # 3. Translação (Câmera -> Mundo) = -R^T * t
+                    t_cam_world = -R_cam_world @ tvec
 
-                # O sinal de Y no OpenCV cresce para baixo, então invertemos delta_y para o math.atan2
-                # funcionar como cartesiano padrão, ou mantemos e ajustamos.
-                # Vamos assumir padrão imagem:
-                abs_theta = math.atan2(delta_y, delta_x)
+                    # --- FORMATAÇÃO KAIST (Matrix 3x4 achatada) ---
+                    # Formato: timestamp, r11, r12, r13, tx, r21, r22, r23, ty, r31, r32, r33, tz
 
-                # --- RELATIVO AO PRIMEIRO FRAME ---
-                if initial_pose is None:
-                    initial_pose = {"x": abs_x, "y": abs_y, "theta": abs_theta}
-                    rel_x, rel_y, rel_theta = 0, 0, 0
-                    print(f"[THREAD 1] Origem definida: {initial_pose}")
-                else:
-                    # Diferença simples
-                    dx = abs_x - initial_pose["x"]
-                    dy = abs_y - initial_pose["y"]
+                    row1 = [
+                        R_cam_world[0, 0],
+                        R_cam_world[0, 1],
+                        R_cam_world[0, 2],
+                        t_cam_world[0][0],
+                    ]
+                    row2 = [
+                        R_cam_world[1, 0],
+                        R_cam_world[1, 1],
+                        R_cam_world[1, 2],
+                        t_cam_world[1][0],
+                    ]
+                    row3 = [
+                        R_cam_world[2, 0],
+                        R_cam_world[2, 1],
+                        R_cam_world[2, 2],
+                        t_cam_world[2][0],
+                    ]
 
-                    # Para rotacionar as coordenadas para alinhar com a orientação inicial do robô:
-                    # x_rel = dx * cos(-th0) - dy * sin(-th0)
-                    # y_rel = dx * sin(-th0) + dy * cos(-th0)
-                    # Mas se você quer apenas o deslocamento relativo à câmera:
-                    rel_x = dx
-                    rel_y = dy
+                    # Salva no CSV
+                    csv_data = [timestamp_ns] + row1 + row2 + row3
+                    csv_writer.writerow(csv_data)
+                    csv_file.flush()  # Garante gravação imediata no disco
+                    print("SALVOU")
 
-                    rel_theta = abs_theta - initial_pose["theta"]
+                    # --- Extração para Display (Visualização apenas) ---
+                    display_x = float(t_cam_world[0])
+                    # Dependendo do eixo (assumindo Z para frente no PnP padrão)
+                    display_y = float(t_cam_world[2])
 
-                    # Normalizar theta entre -pi e pi
-                    rel_theta = (rel_theta + np.pi) % (2 * np.pi) - np.pi
+                    # Lógica de Inicialização do Robô
+                    if not VISUAL_READY:
+                        print(f"[THREAD VISUAL] Inicializado! Pose salva no CSV.")
+                        with data_lock:
+                            VISUAL_READY = True
 
-                ground_truth_data.append([current_time, rel_x, rel_y, rel_theta])
+        # Atualiza GUI
+        frame_resized = cv2.resize(frame, (320, 240))
+        cv2.putText(
+            frame_resized,
+            f"GT X:{display_x:.2f} Z:{display_y:.2f}",
+            (10, 230),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            2,
+        )
 
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        with data_lock:
+            shared_frame_rtsp = frame_rgb
+
+    # Limpeza final
+    csv_file.close()
     cap.release()
-
-    # Salvar CSV ao final
-    if ground_truth_data:
-        df = pd.DataFrame(ground_truth_data, columns=["timestamp", "x", "y", "theta"])
-        df.to_csv("gt_visual_relativo.csv", index=False)
-        print("[THREAD 1] CSV Visual salvo.")
+    print("[THREAD VISUAL] Finalizada e arquivo salvo.")
 
 
-# ==========================================
-# THREAD 2: WEBCAM RECORDER (DATASET)
-# ==========================================
-def run_webcam_recorder():
-    global program_running, global_start_time
+def run_robot_control():
+    global \
+        program_running, \
+        shared_robot_pose, \
+        shared_trajectory_points, \
+        shared_current_goal, \
+        ROBOT_FINISHED, \
+        pose_lock
 
-    SAVE_DIR = "dataset_images"
-    if not os.path.exists(SAVE_DIR):
-        os.makedirs(SAVE_DIR)
+    # 1. Aguarda a Visual Odometry estar pronta (Sincronia de Threads)
+    print("[THREAD CONTROL] Aguardando Câmera Visual...")
+    while program_running and not VISUAL_READY:
+        time.sleep(0.1)
 
-    # Tenta índice 0 (webcam integrada) ou 2 (se 1 for virtual/outro)
-    # Se der erro, verifique qual ID é sua webcam USB
-    cap_web = cv2.VideoCapture(0)
+    if not program_running:
+        return
 
-    print("[THREAD 2] Webcam Recording Iniciada...")
+    print("[THREAD CONTROL] Câmera OK. Iniciando controle do robô!")
 
-    while program_running:
-        ret, frame = cap_web.read()
-        if ret:
-            # Timestamp preciso para nome do arquivo
-            ts = time.time() - global_start_time
-            filename = f"{SAVE_DIR}/img_{ts:.4f}.jpg"
-            cv2.imwrite(filename, frame)
-
-            # Pequeno sleep para não explodir o HD (ex: 10 FPS)
-            time.sleep(0.1)
-        else:
-            time.sleep(0.1)
-
-    cap_web.release()
-    print("[THREAD 2] Webcam Finalizada.")
-
-
-# ==========================================
-# MAIN THREAD: ROBOT CONTROL & PYGAME
-# ==========================================
-def main():
-    global program_running, global_start_time
-    # 1. Iniciar Threads Secundárias
-    t_visual = threading.Thread(target=run_visual_odometry)
-    t_webcam = threading.Thread(target=run_webcam_recorder)
-
-    t_visual.start()
-    t_webcam.start()
-
-    # 2. Configuração do Robô (Código Original Adaptado)
+    # 2. Config Hardware
     PORT = "/dev/ttyACM0"
     BAUDRATE = 9600
-    TIMEOUT = 0.1
+    TIMEOUT = 0.05
     WHEEL_RADIUS = 0.06
     WHEEL_BASE = 0.335
     TICKS_PER_REVOLUTION = 980
+
+    # Parâmetros PID / Controle
     MAX_PWM = 48
     MAX_PWM_STEP = 10
     MAX_SPEED_DISTANCE = 1
 
-    pygame.init()
-    screen = pygame.display.set_mode((200, 100))
-    pygame.display.set_caption("ROBÔ CONTROLLER - Main")
-    font = pygame.font.SysFont("Arial", 18)
+    # --- SETUP ARQUIVO ENCODER (KAIST FORMAT) ---
+    # Formato: timestamp_ns, left_ticks, right_ticks
+    session_name = time.strftime("%Y%m%d_%H%M%S")
+    ENC_FILENAME = f"encoder_kaist_{session_name}.csv"
 
+    enc_file = open(ENC_FILENAME, mode="w", newline="")
+    enc_writer = csv.writer(enc_file)
+
+    # Cabeçalho opcional (Datasets puros geralmente não tem, mas ajuda no debug)
+    # enc_writer.writerow(["timestamp", "left", "right"])
+    print(f"[THREAD CONTROL] Salvando dados de encoder em: {ENC_FILENAME}")
+
+    # Inicializa Objetos
     left_wheel_encoder = encoder.encoder(TICKS_PER_REVOLUTION, WHEEL_RADIUS)
     right_wheel_encoder = encoder.encoder(TICKS_PER_REVOLUTION, WHEEL_RADIUS)
-    arduino = serialCom.Communication(PORT, BAUDRATE, TIMEOUT)
-    arduino.open()
-    time.sleep(3)  # Aguarda reset do arduino
 
-    clock = pygame.time.Clock()
-    FPS = 100
+    try:
+        arduino = serialCom.Communication(PORT, BAUDRATE, TIMEOUT)
+        arduino.open()
+        time.sleep(2)  # Reset Arduino
+    except Exception as e:
+        print(f"[ERROR] Não foi possível conectar ao Arduino: {e}")
+        return
 
     odom = odometry.odometry(left_wheel_encoder, right_wheel_encoder, WHEEL_BASE)
     controller = goToGoal.GoToGoal()
 
     # Variáveis de Controle
     start_time_ns = time.time_ns()
-    last_read = time.time()
-    last_left_pwm = 128
-    last_right_pwm = 128
+    last_left_pwm, last_right_pwm = 128, 128
 
-    pose_log = {"timestamp": [], "x": [], "y": [], "theta": []}
-
-    # Path Planning
-    PATH = [[0, 1], [1, 1]]
+    # Trajetória
+    PATH = [[0, 1], [1, 1], [1, 0], [0, 0]]
+    PATH = [[0, 1]]
     step = 0
     goal = PATH[step]
-
     last_w = 0
 
-    print("SISTEMA RODANDO. Pressione 'Q' na janela do Pygame para parar TUDO.")
-
+    # Loop de Controle
     while program_running:
-        # --- Pygame Events ---
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                program_running = False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_q:
-                    program_running = False
+        iter_start = time.time()
 
-        # --- Leitura Arduino ---
-        le = arduino.get_encoder_left()
-        ld = arduino.get_encoder_right()
+        # A. Leitura Serial & Gravação de Dataset
+        if arduino:
+            le = arduino.get_encoder_left()
+            ld = arduino.get_encoder_right()
 
-        if le and ld:
-            right_wheel_encoder.counter = int(ld)
-            left_wheel_encoder.counter = int(le)
-            last_read = time.time()
-        elif time.time() - last_read > 10:
-            print("Timeout Arduino!")
-            program_running = False
-            break
+            # Timestamp exato da leitura (Nanosegundos)
+            read_time_ns = time.time_ns()
 
-        # --- Odometria ---
+            if le and ld:
+                # Atualiza os objetos encoder para a odometria
+                left_wheel_encoder.counter = int(le)
+                right_wheel_encoder.counter = int(ld)
+
+                # --- SALVAR NO CSV ---
+                # Formato KAIST: timestamp, left_val, right_val
+                enc_writer.writerow([read_time_ns, int(le), int(ld)])
+                # Flush garante que o dado vai pro disco mesmo se o robô desligar do nada
+                enc_file.flush()
+
+        # B. Odometria Math (Dead Reckoning)
         current_time_ns = time.time_ns()
-        dt = current_time_ns - start_time_ns  # Convertendo para segundos
-
+        dt = current_time_ns - start_time_ns
         start_time_ns = current_time_ns
 
         odom.step()
         x, y, theta = odom.getPose()
 
-        # Log
-        pose_log["timestamp"].append(time.time() - global_start_time)
-        pose_log["x"].append(x)
-        pose_log["y"].append(y)
-        pose_log["theta"].append(theta)
+        # C. Atualiza Globais (para a interface gráfica)
+        with pose_lock:
+            shared_robot_pose["x"] = x
+            shared_robot_pose["y"] = y
+            shared_robot_pose["theta"] = theta
+            shared_current_goal = goal
 
-        # --- Controle ---
-        w = controller.step(goal[0], goal[1], x, y, theta, dt, precision=0.05)
+            # Adiciona ponto à trajetoria visual apenas se o robô se moveu significativamente
+            # (Opcional: evitar encher a memória se estiver parado)
+            if (
+                len(shared_trajectory_points) == 0
+                or (
+                    (x - shared_trajectory_points[-1][0]) ** 2
+                    + (y - shared_trajectory_points[-1][1]) ** 2
+                )
+                > 0.0001
+            ):
+                shared_trajectory_points.append((x, y))
 
-        if w is not None:
-            last_w = w
-        else:
-            # Chegou ao ponto atual da trajetória
-            if step + 1 == len(PATH):
-                print("Trajetória concluída!")
-                break
-            step += 1
-            goal = PATH[step]
-            plt.scatter(goal[0], goal[1], marker="x", color="r")
-            w = last_w
+        # D. Controle (Go To Goal)
+        if not ROBOT_FINISHED:
+            # Algoritmo de controle retorna velocidade angular (w) necessária
+            w = controller.step(goal[0], goal[1], x, y, theta, dt, precision=0.05)
 
-        left_vel, right_vel = odometry.uni_to_diff(
-            5, w, left_wheel_encoder, right_wheel_encoder, WHEEL_BASE
-        )
+            if w is not None:
+                last_w = w
+            else:
+                # Chegou no waypoint
+                if step + 1 < len(PATH):
+                    step += 1
+                    goal = PATH[step]
+                    last_w = 0
+                    print(f"[THREAD CONTROL] Waypoint atingido! Próximo: {goal}")
+                else:
+                    print("[THREAD CONTROL] Trajetória Finalizada!")
+                    ROBOT_FINISHED = True
+                    last_w = 0
 
-        # --- Conversão PWM ---
-        # (Simplificada para brevidade, mantendo lógica do usuário)
-        max_val = max(abs(left_vel), abs(right_vel))
-        left_norm = left_vel / max_val if max_val > 0 else 0
-        right_norm = right_vel / max_val if max_val > 0 else 0
-
-        # Speed limit logic do usuario
-        max_speed_control = controller.speed_limit_by_distance(
-            MAX_SPEED_DISTANCE, MAX_PWM, goal[0], goal[1], x, y
-        )
-
-        left_pwm = (left_norm * max_speed_control) + 128
-        right_pwm = (right_norm * max_speed_control) + 128
-
-        # Rampa
-        last_left_pwm += max(min(left_pwm - last_left_pwm, MAX_PWM_STEP), -MAX_PWM_STEP)
-        last_right_pwm += max(
-            min(right_pwm - last_right_pwm, MAX_PWM_STEP), -MAX_PWM_STEP
-        )
-
-        arduino.set_speed_left(int(last_left_pwm))
-        arduino.set_speed_right(int(last_right_pwm))
-
-        # Atualiza tela pygame (mostra status)
-        screen.fill((0, 0, 0))
-        text_surf = font.render(
-            f"X: {x:.2f} Y: {y:.2f} Th: {theta:.2f}", True, (255, 255, 255)
-        )
-        screen.blit(text_surf, (10, 10))
-        pygame.display.flip()
-
-        clock.tick(FPS)
-
-    # --- CLEANUP ---
-    print("Encerrando sistema...")
-    program_running = False  # Garante que threads parem
-
-    # Parar Robô
-    arduino.set_speed_left(128)
-    arduino.set_speed_right(128)
-    time.sleep(0.1)
-    arduino.close()
-
-    # Aguarda threads
-    t_visual.join()
-    t_webcam.join()
-
-    pygame.quit()
-    plt.close()
-
-    # Salvar CSV Odometria
-    filename = "trajetoria_odom.csv"
-    with open(filename, mode="w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["timestamp", "x", "y", "theta"])
-        for i in range(len(pose_log["timestamp"])):
-            writer.writerow(
-                [
-                    pose_log["timestamp"][i],
-                    pose_log["x"][i],
-                    pose_log["y"][i],
-                    pose_log["theta"][i],
-                ]
+            # Calcula velocidades lineares das rodas (Modelo Diferencial)
+            left_vel, right_vel = odometry.uni_to_diff(
+                5,  # Velocidade linear alvo (m/s) - Ajuste conforme necessário
+                last_w,
+                left_wheel_encoder,
+                right_wheel_encoder,
+                WHEEL_BASE,
             )
-    print(f"CSV Odom salvo: {filename}")
 
-    # Plotly Final
-    fig_go = go.Figure(
-        go.Scatter(
-            x=pose_log["x"], y=pose_log["y"], mode="lines+markers", name="Odometria"
-        )
+            # Normalização e Limitação de PWM
+            max_val = max(abs(left_vel), abs(right_vel))
+            # Evita divisão por zero
+            if max_val == 0:
+                left_norm, right_norm = 0, 0
+            else:
+                left_norm = left_vel / max_val
+                right_norm = right_vel / max_val
+
+            # Reduz velocidade quando chega perto do alvo
+            spd_ctrl = controller.speed_limit_by_distance(
+                MAX_SPEED_DISTANCE, MAX_PWM, goal[0], goal[1], x, y
+            )
+
+            # Converte para PWM (0-255, onde 128 é parado)
+            target_l = (left_norm * spd_ctrl) + 128
+            target_r = (right_norm * spd_ctrl) + 128
+
+            # Rampa de Aceleração (Suavização para não dar tranco nos motores)
+            last_left_pwm += max(
+                min(target_l - last_left_pwm, MAX_PWM_STEP), -MAX_PWM_STEP
+            )
+            last_right_pwm += max(
+                min(target_r - last_right_pwm, MAX_PWM_STEP), -MAX_PWM_STEP
+            )
+
+            if arduino:
+                arduino.set_speed_left(int(last_left_pwm))
+                arduino.set_speed_right(int(last_right_pwm))
+        else:
+            # Parar robô (128 = 0V no driver comum tipo Sabertooth/BTS com offset)
+            if arduino:
+                arduino.set_speed_left(128)
+                arduino.set_speed_right(128)
+
+        # Controle de Frequência da Thread (50Hz = 0.02s)
+        elapsed = time.time() - iter_start
+        if elapsed < 0.02:
+            time.sleep(0.02 - elapsed)
+
+    # Cleanup
+    if arduino:
+        arduino.close()
+
+    # Fecha arquivo CSV
+    enc_file.close()
+    print("[THREAD CONTROL] Arquivo de encoder salvo e thread finalizada.")
+
+
+# ==========================================
+# THREAD 3: WEBCAM RECORDER
+# ==========================================
+def run_webcam_recorder():
+    global program_running, shared_frame_webcam, data_lock
+
+    # --- CONFIG ---
+    BASE_FOLDER = "kaist_style_data"
+    TARGET_FPS = 10
+    FRAME_INTERVAL = 1.0 / TARGET_FPS
+
+    # Cria uma pasta para a "Sequência" atual (ex: Sequence_01)
+    # Isso é comum em datasets para separar 'runs'
+    session_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    current_session_folder = os.path.join(
+        BASE_FOLDER, f"seq_{session_timestamp}", "image_0"
     )
-    fig_go.update_layout(title="Trajetória Final", xaxis_title="X", yaxis_title="Y")
-    fig_go.write_html("trajetoria_final.html")  # Salva em HTML para não bloquear script
-    print("Plot final salvo em trajetoria_final.html")
+
+    if not os.path.exists(current_session_folder):
+        os.makedirs(current_session_folder)
+        print(f"[WEBCAM] Salvando em: {current_session_folder}")
+
+    cap_web = cv2.VideoCapture(1)
+
+    # 1. Aguarda a Visual Odometry estar pronta
+    print("[THREAD WEBCAM] Aguardando Câmera Visual...")
+    while program_running and not VISUAL_READY:
+        time.sleep(0.1)
+
+    # Tenta definir o FPS no hardware para evitar buffer
+    cap_web.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+
+    print(f"[WEBCAM] Gravando... (Nomes dos arquivos = timestamps em ns)")
+
+    while program_running:
+        start_time = time.time()
+
+        ret, frame = cap_web.read()
+
+        if ret:
+            # --- TIMESTAMP KAIST (Nanosegundos) ---
+            # time.time_ns() retorna o tempo exato do sistema em int (nanosegundos)
+            # Exemplo de saída: 1698421055123456789.jpg
+            timestamp_ns = time.time_ns()
+
+            filename = f"{timestamp_ns}.jpg"
+            save_path = os.path.join(current_session_folder, filename)
+
+            # Salva a imagem
+            cv2.imwrite(save_path, frame)
+
+            # --- DISPLAY ---
+            frame_resized = cv2.resize(frame, (320, 240))
+            frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+            with data_lock:
+                shared_frame_webcam = frame_rgb
+
+        else:
+            time.sleep(0.01)
+
+        # --- CONTROLE DE 10HZ ---
+        processing_time = time.time() - start_time
+        sleep_duration = FRAME_INTERVAL - processing_time
+        if sleep_duration > 0:
+            time.sleep(sleep_duration)
+
+    cap_web.release()
+    print("[WEBCAM] Gravação finalizada.")
+
+
+# ==========================================
+# UTIL: World to Screen
+# ==========================================
+def world_to_screen(x, y, center_x, center_y, scale=100):
+    screen_x = center_x + int(x * scale)
+    screen_y = center_y - int(y * scale)  # Inverte Y
+    return (screen_x, screen_y)
+
+
+# ==========================================
+# MAIN THREAD: VISUALIZATION ONLY
+# ==========================================
+def main():
+    global program_running, VISUAL_READY
+
+    # 1. Iniciar Threads
+    t_visual = threading.Thread(target=run_visual_odometry)
+    t_control = threading.Thread(target=run_robot_control)
+    t_webcam = threading.Thread(target=run_webcam_recorder)
+
+    t_visual.start()
+    t_control.start()
+    t_webcam.start()
+
+    # 2. Config Pygame
+    pygame.init()
+    W_WIDTH, W_HEIGHT = 1000, 600
+    screen = pygame.display.set_mode((W_WIDTH, W_HEIGHT))
+    pygame.display.set_caption("ROBOT DASHBOARD - MULTITHREADED")
+
+    font = pygame.font.SysFont("Arial", 18)
+    clock = pygame.time.Clock()
+
+    # Config Mapa
+    MAP_CX, MAP_CY = 300, 400
+    MAP_SCALE = 150
+
+    while program_running:
+        # Eventos
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                program_running = False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_q:
+                program_running = False
+
+        screen.fill((30, 30, 30))
+
+        # --- LER DADOS DAS THREADS (De forma thread-safe) ---
+        with pose_lock:
+            # Faz uma cópia rápida dos dados para não bloquear a outra thread desenhando
+            curr_x = shared_robot_pose["x"]
+            curr_y = shared_robot_pose["y"]
+            curr_th = shared_robot_pose["theta"]
+            # Copia a lista de pontos (slice [:] cria copia)
+            pts_draw = shared_trajectory_points[::5]  # Pega 1 a cada 5 para ficar leve
+            curr_goal = shared_current_goal
+
+        with data_lock:
+            img_rtsp = shared_frame_rtsp
+            img_web = shared_frame_webcam
+            is_ready = VISUAL_READY
+
+        # --- 1. DESENHAR MAPA ---
+        pygame.draw.rect(screen, (10, 10, 10), (20, 50, 600, 530))  # Fundo
+
+        # Grid/Eixos
+        cx_s, cy_s = world_to_screen(0, 0, MAP_CX, MAP_CY, MAP_SCALE)
+        pygame.draw.line(screen, (50, 50, 50), (20, cy_s), (620, cy_s))  # X
+        pygame.draw.line(screen, (50, 50, 50), (cx_s, 50), (cx_s, 580))  # Y
+
+        # Trajetória
+        if len(pts_draw) > 1:
+            scr_pts = [
+                world_to_screen(p[0], p[1], MAP_CX, MAP_CY, MAP_SCALE) for p in pts_draw
+            ]
+            pygame.draw.lines(screen, (0, 255, 255), False, scr_pts, 2)
+
+        # Robô
+        rx, ry = world_to_screen(curr_x, curr_y, MAP_CX, MAP_CY, MAP_SCALE)
+        pygame.draw.circle(screen, (255, 50, 50), (rx, ry), 12)
+        # Direção
+        hx = rx + math.cos(curr_th) * 20
+        hy = ry - math.sin(curr_th) * 20
+        pygame.draw.line(screen, (255, 255, 0), (rx, ry), (hx, hy), 3)
+
+        # Goal
+        gx, gy = world_to_screen(curr_goal[0], curr_goal[1], MAP_CX, MAP_CY, MAP_SCALE)
+        pygame.draw.circle(screen, (0, 255, 0), (gx, gy), 6)
+
+        # --- 2. DESENHAR CAMERAS ---
+
+        # RTSP View
+        title_rtsp = font.render(
+            f"Visual Odometry (Ready: {is_ready})", True, (200, 200, 200)
+        )
+        screen.blit(title_rtsp, (650, 20))
+
+        if img_rtsp is not None:
+            surf = pygame.surfarray.make_surface(np.rot90(img_rtsp))
+            surf = pygame.transform.flip(surf, True, False)
+            surf = pygame.transform.rotate(surf, 90)
+            screen.blit(surf, (650, 50))
+        else:
+            pygame.draw.rect(screen, (50, 0, 0), (650, 50, 320, 240))
+            screen.blit(font.render("Connecting...", True, (255, 255, 255)), (720, 150))
+
+        # Webcam View
+        screen.blit(font.render("Webcam Dataset", True, (200, 200, 200)), (650, 310))
+        if img_web is not None:
+            surf2 = pygame.surfarray.make_surface(np.rot90(img_web))
+            surf2 = pygame.transform.flip(surf2, True, False)
+            surf2 = pygame.transform.rotate(surf2, 90)
+            screen.blit(surf2, (650, 340))
+
+        # --- INFO ---
+        info_txt = font.render(
+            f"X: {curr_x:.2f}  Y: {curr_y:.2f}  Th: {math.degrees(curr_th):.1f}°",
+            True,
+            (255, 255, 255),
+        )
+        screen.blit(info_txt, (30, 20))
+
+        pygame.display.flip()
+        clock.tick(60)  # 60 FPS na tela (o robô roda na velocidade da thread dele)
+
+    # Cleanup Global
+    print("Desligando main...")
+    t_visual.join()
+    t_control.join()
+    t_webcam.join()
+    pygame.quit()
 
 
 if __name__ == "__main__":
