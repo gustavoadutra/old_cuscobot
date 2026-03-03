@@ -1,6 +1,7 @@
 import threading
 import cv2
 import cv2.aruco as aruco
+from cv2.gapi.streaming import timestamp
 import numpy as np
 import time
 import pandas as pd
@@ -11,6 +12,7 @@ import matplotlib.pyplot as plt
 import pygame
 import plotly.graph_objects as go
 from datetime import datetime
+from scipy.spatial.transform import Rotation as R
 
 
 # --- IMPORT SEUS MODULOS EXISTENTES ---
@@ -26,7 +28,7 @@ program_running = True
 global_start_time = time.time()
 
 # Locks para segurança entre threads
-data_lock = threading.Lock()  # Para imagens e flags
+data_lock = threading.Lock()  # z
 pose_lock = threading.Lock()  # Para odometria e trajetória
 
 # Estado do Sistema
@@ -42,6 +44,24 @@ shared_robot_pose = {"x": 0, "y": 0, "theta": 0}
 shared_trajectory_points = []  # Lista de tuplas (x, y)
 shared_current_goal = (0, 0)
 
+# ==========================================
+# CRIAR ESTRUTURA DE PASTAS
+# ==========================================
+# Nome da pasta principal com timestamp
+TIMESTAMP_STR = datetime.fromtimestamp(global_start_time).strftime("%Y%m%d_%H%M%S")
+GLOBAL_FOLDER = f"dataset_{TIMESTAMP_STR}"
+
+# Criar estrutura de pastas
+SENSOR_DATA_FOLDER = os.path.join(GLOBAL_FOLDER, "sensor_data")
+STEREO_LEFT_FOLDER = os.path.join(GLOBAL_FOLDER, "stereo_left")
+
+os.makedirs(SENSOR_DATA_FOLDER, exist_ok=True)
+os.makedirs(STEREO_LEFT_FOLDER, exist_ok=True)
+
+print(f"[SETUP] Pasta principal criada: {GLOBAL_FOLDER}")
+print(f"[SETUP] Sensor data: {SENSOR_DATA_FOLDER}")
+print(f"[SETUP] Stereo left: {STEREO_LEFT_FOLDER}")
+
 
 def run_visual_odometry():
     global \
@@ -54,10 +74,20 @@ def run_visual_odometry():
     # --- CONFIG ---
     TAMANHO_REAL_MARKER = 0.15  # Metros
     ARUCO_ID = 42
-    RTSP_URL = "rtsp://admin:nupedee7@192.168.0.108:554/cam/realmonitor?channel=1&subtype=0&proto=Onvif"
+    RTSP_URL = "rtsp://admin:nupedee7@192.168.1.6:554/cam/realmonitor?channel=1&subtype=0&proto=Onvif"
 
-    # Nome do arquivo de saída (padrão KAIST)
-    CSV_FILENAME = "global_pose.csv"
+    # Nome do arquivo de saída (dentro de sensor_data)
+    CSV_FILENAME = os.path.join(SENSOR_DATA_FOLDER, "vrs_gps.csv")
+
+    # --- NOVO: Pasta para imagens RTSP ---
+    RTSP_IMAGES_FOLDER = os.path.join(GLOBAL_FOLDER, "rtsp_images")
+    os.makedirs(RTSP_IMAGES_FOLDER, exist_ok=True)
+    print(f"[THREAD VISUAL] Imagens RTSP serão salvas em: {RTSP_IMAGES_FOLDER}")
+
+    # Arquivo de timestamp para imagens RTSP
+    RTSP_STAMP_FILENAME = os.path.join(SENSOR_DATA_FOLDER, "rtsp_stamp.csv")
+    rtsp_stamp_file = open(RTSP_STAMP_FILENAME, mode="w", newline="")
+    rtsp_stamp_writer = csv.writer(rtsp_stamp_file)
 
     # --- CALIBRAÇÃO--- Implementar
     c_w, c_h = 1280, 720
@@ -105,6 +135,15 @@ def run_visual_odometry():
         # Timestamp KAIST: Nanosegundos do sistema
         timestamp_ns = time.time_ns()
 
+        # --- NOVO: Salvar imagem raw ---
+        filename = f"{timestamp_ns}.png"
+        save_path = os.path.join(RTSP_IMAGES_FOLDER, filename)
+        cv2.imwrite(save_path, frame)
+
+        # Salvar timestamp
+        rtsp_stamp_writer.writerow([timestamp_ns])
+        rtsp_stamp_file.flush()
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, rejected = detector.detectMarkers(gray)
 
@@ -136,46 +175,36 @@ def run_visual_odometry():
                     # Queremos a Pose da Câmera no Mundo (Referencial do Marker)
 
                     # 1. Rotação (Marker -> Câmera)
-                    R_mk_cam, _ = cv2.Rodrigues(rvec)
+                    rmat, _ = cv2.Rodrigues(rvec)
+                    r = R.from_matrix(rmat)
+                    # Yaw, Pitch, Roll em graus
+                    euler_angles = r.as_euler("zyx", degrees=True)
+                    heading_degrees = euler_angles[0]  # Yaw em graus
 
-                    # 2. Rotação (Câmera -> Mundo) = Transposta
-                    R_cam_world = R_mk_cam.T
-
-                    # 3. Translação (Câmera -> Mundo) = -R^T * t
-                    t_cam_world = -R_cam_world @ tvec
-
-                    # --- FORMATAÇÃO KAIST (Matrix 3x4 achatada) ---
-                    # Formato: timestamp, r11, r12, r13, tx, r21, r22, r23, ty, r31, r32, r33, tz
-
-                    row1 = [
-                        R_cam_world[0, 0],
-                        R_cam_world[0, 1],
-                        R_cam_world[0, 2],
-                        t_cam_world[0][0],
-                    ]
-                    row2 = [
-                        R_cam_world[1, 0],
-                        R_cam_world[1, 1],
-                        R_cam_world[1, 2],
-                        t_cam_world[1][0],
-                    ]
-                    row3 = [
-                        R_cam_world[2, 0],
-                        R_cam_world[2, 1],
-                        R_cam_world[2, 2],
-                        t_cam_world[2][0],
+                    new_row = [
+                        timestamp_ns,  # 0: Timestamp
+                        0,  # 1: Ignorado pelo loader
+                        0,  # 2: Ignorado pelo loader
+                        tvec[0][0],  # 3: X (Loader lê gps_x_raw aqui)
+                        tvec[1][0],  # 4: Y (Loader lê gps_y_raw aqui)
+                        tvec[2][0],  # 5: Z (Loader lê gps_z_raw aqui)
+                        0,
+                        0,
+                        0,  # 6, 7, 8: Covariância (Ignorado)
+                        0,
+                        0,
+                        0,  # 9, 10, 11: Covariância (Ignorado)
+                        1,  # 12: Status Flag (OBRIGATÓRIO SER 1 para ler rotação)
+                        heading_degrees,  # 13: Heading em graus
                     ]
 
-                    # Salva no CSV
-                    csv_data = [timestamp_ns] + row1 + row2 + row3
-                    csv_writer.writerow(csv_data)
+                    csv_writer.writerow(new_row)
                     csv_file.flush()  # Garante gravação imediata no disco
-                    print("SALVOU")
 
                     # --- Extração para Display (Visualização apenas) ---
-                    display_x = float(t_cam_world[0])
+                    display_x = float(tvec[0])
                     # Dependendo do eixo (assumindo Z para frente no PnP padrão)
-                    display_y = float(t_cam_world[2])
+                    display_y = float(tvec[2])
 
                     # Lógica de Inicialização do Robô
                     if not VISUAL_READY:
@@ -201,8 +230,9 @@ def run_visual_odometry():
 
     # Limpeza final
     csv_file.close()
+    rtsp_stamp_file.close()
     cap.release()
-    print("[THREAD VISUAL] Finalizada e arquivo salvo.")
+    print("[THREAD VISUAL] Finalizada e arquivos salvos.")
 
 
 def run_robot_control():
@@ -233,14 +263,13 @@ def run_robot_control():
     TICKS_PER_REVOLUTION = 980
 
     # Parâmetros PID / Controle
-    MAX_PWM = 48
+    MAX_PWM = 10
     MAX_PWM_STEP = 10
     MAX_SPEED_DISTANCE = 1
 
     # --- SETUP ARQUIVO ENCODER (KAIST FORMAT) ---
     # Formato: timestamp_ns, left_ticks, right_ticks
-    session_name = time.strftime("%Y%m%d_%H%M%S")
-    ENC_FILENAME = f"encoder_kaist_{session_name}.csv"
+    ENC_FILENAME = os.path.join(SENSOR_DATA_FOLDER, "encoder.csv")
 
     enc_file = open(ENC_FILENAME, mode="w", newline="")
     enc_writer = csv.writer(enc_file)
@@ -270,7 +299,7 @@ def run_robot_control():
 
     # Trajetória
     PATH = [[0, 1], [1, 1], [1, 0], [0, 0]]
-    PATH = [[0, 1]]
+    # PATH = [[0, 1]]
     step = 0
     goal = PATH[step]
     last_w = 0
@@ -281,22 +310,29 @@ def run_robot_control():
 
         # A. Leitura Serial & Gravação de Dataset
         if arduino:
-            le = arduino.get_encoder_left()
-            ld = arduino.get_encoder_right()
+            try:
+                le_raw = arduino.get_encoder_left()
+                ld_raw = arduino.get_encoder_right()
 
-            # Timestamp exato da leitura (Nanosegundos)
-            read_time_ns = time.time_ns()
+                # Timestamp exato da leitura (Nanosegundos)
+                read_time_ns = time.time_ns()
 
-            if le and ld:
-                # Atualiza os objetos encoder para a odometria
-                left_wheel_encoder.counter = int(le)
-                right_wheel_encoder.counter = int(ld)
+                # SÓ PROCESSA SE OS DADOS FOREM VÁLIDOS (DIFERENTES DE NONE)
+                if le_raw is not None and ld_raw is not None:
+                    # Converte para int aqui dentro do try para evitar erro de conversão
+                    le_val = int(le_raw)
+                    ld_val = int(ld_raw)
 
-                # --- SALVAR NO CSV ---
-                # Formato KAIST: timestamp, left_val, right_val
-                enc_writer.writerow([read_time_ns, int(le), int(ld)])
-                # Flush garante que o dado vai pro disco mesmo se o robô desligar do nada
-                enc_file.flush()
+                    # Atualiza os objetos encoder para a odometria
+                    left_wheel_encoder.counter = le_val
+                    right_wheel_encoder.counter = ld_val
+
+                    # --- SALVAR NO CSV ---
+                    enc_writer.writerow([read_time_ns, le_val, ld_val])
+                    enc_file.flush()
+            except ValueError:
+                # Se chegou uma string suja tipo "12a4", ignora este ciclo
+                pass
 
         # B. Odometria Math (Dead Reckoning)
         current_time_ns = time.time_ns()
@@ -346,7 +382,7 @@ def run_robot_control():
 
             # Calcula velocidades lineares das rodas (Modelo Diferencial)
             left_vel, right_vel = odometry.uni_to_diff(
-                5,  # Velocidade linear alvo (m/s) - Ajuste conforme necessário
+                3,  # Velocidade linear alvo (m/s) - Ajuste conforme necessário
                 last_w,
                 left_wheel_encoder,
                 right_wheel_encoder,
@@ -388,11 +424,6 @@ def run_robot_control():
                 arduino.set_speed_left(128)
                 arduino.set_speed_right(128)
 
-        # Controle de Frequência da Thread (50Hz = 0.02s)
-        elapsed = time.time() - iter_start
-        if elapsed < 0.02:
-            time.sleep(0.02 - elapsed)
-
     # Cleanup
     if arduino:
         arduino.close()
@@ -402,29 +433,23 @@ def run_robot_control():
     print("[THREAD CONTROL] Arquivo de encoder salvo e thread finalizada.")
 
 
-# ==========================================
-# THREAD 3: WEBCAM RECORDER
-# ==========================================
 def run_webcam_recorder():
     global program_running, shared_frame_webcam, data_lock
 
     # --- CONFIG ---
-    BASE_FOLDER = "kaist_style_data"
-    TARGET_FPS = 10
+    TARGET_FPS = 30
     FRAME_INTERVAL = 1.0 / TARGET_FPS
 
-    # Cria uma pasta para a "Sequência" atual (ex: Sequence_01)
-    # Isso é comum em datasets para separar 'runs'
-    session_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    current_session_folder = os.path.join(
-        BASE_FOLDER, f"seq_{session_timestamp}", "image_0"
-    )
+    # As imagens vão direto para stereo_left
+    print(f"[WEBCAM] Salvando imagens em: {STEREO_LEFT_FOLDER}")
 
-    if not os.path.exists(current_session_folder):
-        os.makedirs(current_session_folder)
-        print(f"[WEBCAM] Salvando em: {current_session_folder}")
+    # --- SETUP ARQUIVO ENCODER (KAIST FORMAT) ---
+    # Formato: timestamp_ns, left_ticks, right_ticks
+    STEREO_STAMP_FILENAME = os.path.join(SENSOR_DATA_FOLDER, "stereo_stamp.csv")
 
-    cap_web = cv2.VideoCapture(1)
+    stereo_stamp = open(STEREO_STAMP_FILENAME, mode="w", newline="")
+    stereo_stamp_writer = csv.writer(stereo_stamp)
+    cap_web = cv2.VideoCapture(2)
 
     # 1. Aguarda a Visual Odometry estar pronta
     print("[THREAD WEBCAM] Aguardando Câmera Visual...")
@@ -434,7 +459,7 @@ def run_webcam_recorder():
     # Tenta definir o FPS no hardware para evitar buffer
     cap_web.set(cv2.CAP_PROP_FPS, TARGET_FPS)
 
-    print(f"[WEBCAM] Gravando... (Nomes dos arquivos = timestamps em ns)")
+    print("[WEBCAM] Gravando... ")
 
     while program_running:
         start_time = time.time()
@@ -447,10 +472,12 @@ def run_webcam_recorder():
             # Exemplo de saída: 1698421055123456789.jpg
             timestamp_ns = time.time_ns()
 
-            filename = f"{timestamp_ns}.jpg"
-            save_path = os.path.join(current_session_folder, filename)
+            filename = f"{timestamp_ns}.png"
+            save_path = os.path.join(STEREO_LEFT_FOLDER, filename)
 
             # Salva a imagem
+            # Camera foi colocada ao contrario
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
             cv2.imwrite(save_path, frame)
 
             # --- DISPLAY ---
@@ -459,6 +486,9 @@ def run_webcam_recorder():
             with data_lock:
                 shared_frame_webcam = frame_rgb
 
+            stereo_stamp_writer.writerow([timestamp_ns])
+
+            stereo_stamp.flush()
         else:
             time.sleep(0.01)
 
@@ -469,6 +499,8 @@ def run_webcam_recorder():
             time.sleep(sleep_duration)
 
     cap_web.release()
+    stereo_stamp.close()
+
     print("[WEBCAM] Gravação finalizada.")
 
 
@@ -486,6 +518,14 @@ def world_to_screen(x, y, center_x, center_y, scale=100):
 # ==========================================
 def main():
     global program_running, VISUAL_READY
+
+    print("=" * 60)
+    print(f"DATASET COLLECTION SESSION")
+    print(f"Pasta principal: {GLOBAL_FOLDER}")
+    print(f"  - sensor_data/encoder.csv")
+    print(f"  - sensor_data/vrs_gps.csv")
+    print(f"  - stereo_left/*.png")
+    print("=" * 60)
 
     # 1. Iniciar Threads
     t_visual = threading.Thread(target=run_visual_odometry)
@@ -594,6 +634,14 @@ def main():
         )
         screen.blit(info_txt, (30, 20))
 
+        # Informação da pasta
+        folder_txt = font.render(
+            f"Saving to: {GLOBAL_FOLDER}",
+            True,
+            (150, 150, 150),
+        )
+        screen.blit(folder_txt, (30, 560))
+
         pygame.display.flip()
         clock.tick(60)  # 60 FPS na tela (o robô roda na velocidade da thread dele)
 
@@ -603,6 +651,11 @@ def main():
     t_control.join()
     t_webcam.join()
     pygame.quit()
+
+    print("=" * 60)
+    print(f"DATASET SALVO COM SUCESSO!")
+    print(f"Localização: {GLOBAL_FOLDER}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
