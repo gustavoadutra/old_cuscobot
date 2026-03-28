@@ -74,7 +74,7 @@ def run_visual_odometry():
     # --- CONFIG ---
     TAMANHO_REAL_MARKER = 0.15  # Metros
     ARUCO_ID = 42
-    RTSP_URL = "rtsp://admin:nupedee7@192.168.1.6:554/cam/realmonitor?channel=1&subtype=0&proto=Onvif"
+    RTSP_URL = "rtsp://admin:nupedee7@192.168.1.4:554/cam/realmonitor?channel=1&subtype=0&proto=Onvif"
 
     # Nome do arquivo de saída (dentro de sensor_data)
     CSV_FILENAME = os.path.join(SENSOR_DATA_FOLDER, "vrs_gps.csv")
@@ -111,7 +111,7 @@ def run_visual_odometry():
         dtype=np.float32,
     )
 
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
 
     print("[THREAD VISUAL] Conectando ao RTSP...")
     cap = cv2.VideoCapture(RTSP_URL)
@@ -257,14 +257,14 @@ def run_robot_control():
     # 2. Config Hardware
     PORT = "/dev/ttyACM0"
     BAUDRATE = 9600
-    TIMEOUT = 0.05
+    TIMEOUT = 1
     WHEEL_RADIUS = 0.06
     WHEEL_BASE = 0.335
     TICKS_PER_REVOLUTION = 980
 
     # Parâmetros PID / Controle
-    MAX_PWM = 10
-    MAX_PWM_STEP = 10
+    MAX_PWM = 48 # 48 
+    MAX_PWM_STEP = 10 # 10 
     MAX_SPEED_DISTANCE = 1
 
     # --- SETUP ARQUIVO ENCODER (KAIST FORMAT) ---
