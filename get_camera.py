@@ -11,17 +11,21 @@ import math
 TAMANHO_REAL_MARKER = 0.15  # 15 cm em metros
 ARUCO_ID = 42  # ID do marcador que você imprimiu
 
-rtsp_url = "rtsp://admin:nupedee7@192.168.1.6:554/cam/realmonitor?channel=1&subtype=0&proto=Onvif"
+rtsp_url = "rtsp://admin:nupedee7@192.168.1.4:554/cam/realmonitor?channel=1&subtype=0&proto=Onvif"
 
 # Configuração Opcional: Forçar TCP ao invés de UDP
 # Isso ajuda a evitar "smearing" (borrões cinzas) se a rede oscilar,
 # o que é CRUCIAL para Odometria Visual.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
 # Inicia a captura
 cap = cv2.VideoCapture(rtsp_url)
 
-
+# Define resolução menor
+#cap.set(cv2.CAP_PROP_FRAME_WIDTH, 240)   # Metade da largura
+#cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)  # Metade da altura
+#cap.set(cv2.CAP_PROP_FPS, 15)            # Reduza FPS se possível (padrão é 30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)      # Reduz buffer (menos lag)
 # Configuração do ArUco (Nova API)
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 parameters = aruco.DetectorParameters()

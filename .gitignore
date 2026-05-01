@@ -1,2 +1,7 @@
 dataset_*
 *.pyc
+.vscode
+__pycache__
+*.code-workspace
+calibration
+*.pyc
